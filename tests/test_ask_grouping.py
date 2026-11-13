@@ -207,7 +207,7 @@ def test_handle_stop_emits_complete_asks_only(tmp_path, monkeypatch):
         _j(type="user", timestamp="2026-06-22T00:01:02Z",
            message={"role": "user",
                     "content": [{"type": "tool_result", "tool_use_id": "tu-pending",
-                                 "content": "Task launched"}]}),
+                                 "content": "Async agent launched successfully."}]}),
         # NO task-notification turn yet
     ]
     tpath.write_text("\n".join(lines) + "\n")
@@ -345,7 +345,7 @@ def test_out_of_order_emission(tmp_path, monkeypatch):
         _j(type="user", timestamp="2026-06-22T10:00:02Z",
            message={"role": "user",
                     "content": [{"type": "tool_result", "tool_use_id": "tu-ooo",
-                                 "content": "Task launched"}]}),
+                                 "content": "Async agent launched successfully."}]}),
         # Q2: new human question (no sub-agent) — should emit at first Stop
         _j(type="user", message={"role": "user", "content": "another question"},
            timestamp="2026-06-22T10:01:00Z"),
@@ -412,3 +412,27 @@ def test_out_of_order_emission(tmp_path, monkeypatch):
     )
     # Verify no duplicate emission
     assert len(set(st2.emitted_ask_keys)) == 2, "Keys must be unique (no duplicates)"
+
+
+def test_handle_stop_emits_foreground_subagent_ask(tmp_path, monkeypatch):
+    """A foreground Task/Agent returns its result inline and never sends a
+    <task-notification>, so its ask must emit at Stop, not wait for SessionEnd."""
+    from pathlib import Path
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+
+    exp = InMemorySpanExporter()
+    def fake_tracer(cfg, git):
+        prov = TracerProvider(); prov.add_span_processor(SimpleSpanProcessor(exp))
+        return prov.get_tracer("t"), (lambda: None)
+    monkeypatch.setattr(emit, "_tracer", fake_tracer)
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("", ""))
+
+    # simple-session: turn 1 is plain, turn 2 runs a foreground Task (status=completed).
+    tpath = Path(__file__).parent / "fixtures" / "simple-session" / "transcript.jsonl"
+    emit.handle_stop({"hook_event_name": "Stop", "session_id": "sess-fg",
+                      "transcript_path": str(tpath)})
+
+    agent_spans = [s for s in exp.get_finished_spans()
+                   if s.attributes.get(spans.OI["KIND"]) == "AGENT"]
+    assert len(agent_spans) == 2, f"expected both asks at Stop, got {len(agent_spans)}"
