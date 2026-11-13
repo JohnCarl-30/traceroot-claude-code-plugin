@@ -28,6 +28,7 @@ Ask grouping:
 """
 
 import threading
+import time
 from .config import load_config
 from . import state as _state
 from . import transcript as _t
@@ -102,6 +103,31 @@ def _capped_flush(flush):
     th = threading.Thread(target=flush, daemon=True)
     th.start()
     th.join(5.0)
+
+
+# ---------------------------------------------------------------------------
+# Transcript read
+# ---------------------------------------------------------------------------
+
+def _read_settled(tpath: str, payload: dict) -> list:
+    """Read the transcript, waiting briefly for the turn's final assistant rows.
+
+    Claude Code can fire Stop before those rows are on disk. Emitting then drops
+    the final answer for good, because the ask is marked emitted. The payload's
+    last_assistant_message says what the last assistant text row must end with;
+    without it (older Claude Code, SessionEnd) there is nothing to wait for.
+    """
+    want = str(payload.get("last_assistant_message") or "").strip()
+    deadline = time.monotonic() + 2.0
+    while True:
+        records = _t.read_all_records(tpath)
+        texts = (_s._text(_t._content(r)).strip() for r in reversed(records) if r.get("type") == "assistant")
+        last = next((x for x in texts if x), "")
+        # shortcut: after 2s emit what is there (possibly truncated) rather than
+        # hold the ask; skip the ask instead if truncated traces show up in practice.
+        if not want or (last and want.endswith(last)) or time.monotonic() >= deadline:
+            return records
+        time.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +219,7 @@ def handle_stop(payload: dict, is_session_end: bool = False) -> None:
 
     with _state.session_lock(session_id):
         st = _state.load_state(session_id)
-        records = _t.read_all_records(tpath)
+        records = _read_settled(tpath, payload)
         turns = _t.assemble_turns(records)
         asks = _t.group_turns_into_asks(turns, subagents_dir)
         git = _resolve_git(payload, st)
