@@ -144,29 +144,27 @@ def test_stop_gives_up_after_the_deadline_and_logs_it(tmp_path, monkeypatch):
     assert any("still missing" in line for line in logged)
 
 
-def test_stop_does_not_hold_the_session_lock_while_waiting(tmp_path, monkeypatch):
-    # A SubagentStop for the same session must not queue behind the wait.
-    held = []
-    real_lock = state.session_lock
-
-    def tracking_lock(session_id):
-        cm = real_lock(session_id)
-
-        class Tracked:
-            def __enter__(self):
-                held.append(True)
-                return cm.__enter__()
-
-            def __exit__(self, *a):
-                held.pop()
-                return cm.__exit__(*a)
-
-        return Tracked()
-
+def test_session_end_cannot_overtake_a_waiting_stop(tmp_path, monkeypatch):
+    # While Stop waits for the final rows it must hold the session lock. Otherwise
+    # a SessionEnd arriving in that window reads the half-written transcript,
+    # emits the ask truncated and marks it emitted, and Stop then skips it.
+    import fcntl
     exp, calls = _setup(tmp_path, monkeypatch, [RECORDS[:3], RECORDS])
-    monkeypatch.setattr(state, "session_lock", tracking_lock)
-    monkeypatch.setattr(emit.time, "sleep", lambda s: held and (_ for _ in ()).throw(
-        AssertionError("slept while holding the session lock")))
+    probes = []
 
-    _stop(tmp_path, "sess-lock", "final answer")
+    def sleep_and_probe(seconds):
+        # What a concurrent SessionEnd would hit: the lock must already be taken.
+        with open(state._dir("sess-race") / ".lock", "a+") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                probes.append("free")
+            except BlockingIOError:
+                probes.append("held")
+
+    monkeypatch.setattr(emit.time, "sleep", sleep_and_probe)
+
+    _stop(tmp_path, "sess-race", "final answer")
+
+    assert probes == ["held"]
     assert _root_outputs(exp) == ["final answer"]

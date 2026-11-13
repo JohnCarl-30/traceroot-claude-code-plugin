@@ -133,7 +133,11 @@ def _read_settled(tpath: str, payload: dict) -> list:
     last_assistant_message says what the last assistant text row must contain;
     without it (older Claude Code, SessionEnd) there is nothing to wait for.
 
-    Call this before taking the session lock: it can sleep for up to 2s.
+    Call this with the session lock held. A SessionEnd that arrives during the
+    wait must queue behind it; otherwise it reads the half-written transcript,
+    emits the ask truncated and marks it emitted. The cost is that a concurrent
+    SubagentStop can be delayed by up to 2s. It loses nothing: the sub-agent
+    transcript it copies stays on disk until its hook returns.
     """
     want = str(payload.get("last_assistant_message") or "").strip()
     deadline = time.monotonic() + 2.0
@@ -236,10 +240,9 @@ def handle_stop(payload: dict, is_session_end: bool = False) -> None:
     import os as _os
     subagents_dir = _os.path.join(_os.path.dirname(tpath), session_id, "subagents")
 
-    records = _read_settled(tpath, payload)  # may wait; must not hold the lock
-
     with _state.session_lock(session_id):
         st = _state.load_state(session_id)
+        records = _read_settled(tpath, payload)
         turns = _t.assemble_turns(records)
         asks = _t.group_turns_into_asks(turns, subagents_dir)
         git = _resolve_git(payload, st)
