@@ -436,3 +436,40 @@ def test_handle_stop_emits_foreground_subagent_ask(tmp_path, monkeypatch):
     agent_spans = [s for s in exp.get_finished_spans()
                    if s.attributes.get(spans.OI["KIND"]) == "AGENT"]
     assert len(agent_spans) == 2, f"expected both asks at Stop, got {len(agent_spans)}"
+
+
+def test_handle_stop_holds_subagent_with_no_result_row(tmp_path, monkeypatch):
+    """A Task/Agent call whose tool_result row is not in the transcript yet is
+    unclassified: it may be a background launch, so the ask stays pending at
+    Stop and is flushed at SessionEnd."""
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+
+    tpath = tmp_path / "sess.jsonl"
+    lines = [
+        json.dumps({"type": "user", "timestamp": "2026-06-22T00:00:00Z",
+                    "message": {"role": "user", "content": "run a task"}}),
+        json.dumps({"type": "assistant", "requestId": "r1", "timestamp": "2026-06-22T00:00:01Z",
+                    "message": {"id": "r1", "model": "claude-opus-4-8",
+                                "content": [{"type": "tool_use", "id": "tu-noresult",
+                                             "name": "Agent", "input": {"description": "work"}}],
+                                "usage": {"input_tokens": 5, "output_tokens": 3}}}),
+        # NO tool_result row for tu-noresult
+    ]
+    tpath.write_text("\n".join(lines) + "\n")
+
+    exp = InMemorySpanExporter()
+    def fake_tracer(cfg, git):
+        prov = TracerProvider(); prov.add_span_processor(SimpleSpanProcessor(exp))
+        return prov.get_tracer("t"), (lambda: None)
+    monkeypatch.setattr(emit, "_tracer", fake_tracer)
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("", ""))
+
+    payload = {"session_id": "sess-noresult", "transcript_path": str(tpath)}
+    emit.handle_stop({**payload, "hook_event_name": "Stop"})
+    assert not exp.get_finished_spans(), "unclassified launch must not emit at Stop"
+
+    emit.handle_session_end({**payload, "hook_event_name": "SessionEnd"})
+    agent_spans = [s for s in exp.get_finished_spans()
+                   if s.attributes.get(spans.OI["KIND"]) == "AGENT"]
+    assert len(agent_spans) == 1, "SessionEnd must flush the pending ask"
