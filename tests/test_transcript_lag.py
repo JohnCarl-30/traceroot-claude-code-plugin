@@ -4,29 +4,35 @@ the transcript. handle_stop must wait for them (the payload's
 last_assistant_message says what the last row should contain) instead of
 emitting a truncated trace and marking the ask as done.
 """
-import json
-
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from traceroot_observability import emit, spans, state
 
+
+def _user(text, ts):
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
+
+
+def _assistant(rid, ts, *blocks):
+    """One assistant row. A str block is text; a dict block is used as is."""
+    content = [{"type": "text", "text": b} if isinstance(b, str) else b for b in blocks]
+    return {"type": "assistant", "requestId": rid, "timestamp": ts,
+            "message": {"id": rid, "model": "claude-opus-4-8", "content": content,
+                        "usage": {"input_tokens": 5, "output_tokens": 3}}}
+
+
+TOOL_USE = {"type": "tool_use", "id": "tu-1", "name": "Read", "input": {}}
+TOOL_RESULT = {"type": "user", "timestamp": "2026-06-22T00:00:02Z",
+               "message": {"role": "user",
+                           "content": [{"type": "tool_result", "tool_use_id": "tu-1", "content": "data"}]}}
+
 RECORDS = [
-    {"type": "user", "timestamp": "2026-06-22T00:00:00Z",
-     "message": {"role": "user", "content": "read the file"}},
-    {"type": "assistant", "requestId": "r1", "timestamp": "2026-06-22T00:00:01Z",
-     "message": {"id": "r1", "model": "claude-opus-4-8",
-                 "content": [{"type": "text", "text": "Reading it."},
-                             {"type": "tool_use", "id": "tu-1", "name": "Read", "input": {}}],
-                 "usage": {"input_tokens": 5, "output_tokens": 3}}},
-    {"type": "user", "timestamp": "2026-06-22T00:00:02Z",
-     "message": {"role": "user",
-                 "content": [{"type": "tool_result", "tool_use_id": "tu-1", "content": "data"}]}},
-    {"type": "assistant", "requestId": "r2", "timestamp": "2026-06-22T00:00:03Z",
-     "message": {"id": "r2", "model": "claude-opus-4-8",
-                 "content": [{"type": "text", "text": "final answer"}],
-                 "usage": {"input_tokens": 5, "output_tokens": 3}}},
+    _user("read the file", "2026-06-22T00:00:00Z"),
+    _assistant("r1", "2026-06-22T00:00:01Z", "Reading it.", TOOL_USE),
+    TOOL_RESULT,
+    _assistant("r2", "2026-06-22T00:00:03Z", "final answer"),
 ]
 
 
@@ -55,30 +61,112 @@ def _setup(tmp_path, monkeypatch, reads):
     return exp, calls
 
 
-def _root_output(exp):
-    roots = [s for s in exp.get_finished_spans() if s.attributes.get(spans.OI["KIND"]) == "AGENT"]
-    assert len(roots) == 1
-    return roots[0].attributes.get(spans.OI["OUTPUT"])
+def _stop(tmp_path, sid, last_assistant_message=None):
+    payload = {"hook_event_name": "Stop", "session_id": sid,
+               "transcript_path": str(tmp_path / "t.jsonl")}
+    if last_assistant_message is not None:
+        payload["last_assistant_message"] = last_assistant_message
+    emit.handle_stop(payload)
+
+
+def _root_outputs(exp):
+    return [s.attributes.get(spans.OI["OUTPUT"]) for s in exp.get_finished_spans()
+            if s.attributes.get(spans.OI["KIND"]) == "AGENT"]
 
 
 def test_stop_waits_for_final_assistant_rows(tmp_path, monkeypatch):
     # First two reads lack the final assistant row; the third has it.
     exp, calls = _setup(tmp_path, monkeypatch, [RECORDS[:3], RECORDS[:3], RECORDS])
-
-    emit.handle_stop({"hook_event_name": "Stop", "session_id": "sess-lag",
-                      "transcript_path": str(tmp_path / "t.jsonl"),
-                      "last_assistant_message": "final answer"})
-
+    _stop(tmp_path, "sess-lag", "final answer")
     assert len(calls) == 3
-    assert _root_output(exp) == "final answer"
+    assert _root_outputs(exp) == ["final answer"]
 
 
 def test_stop_reads_once_without_last_assistant_message(tmp_path, monkeypatch):
     # Older Claude Code sends no last_assistant_message: nothing to wait for.
     exp, calls = _setup(tmp_path, monkeypatch, [RECORDS])
-
-    emit.handle_stop({"hook_event_name": "Stop", "session_id": "sess-nolam",
-                      "transcript_path": str(tmp_path / "t.jsonl")})
-
+    _stop(tmp_path, "sess-nolam")
     assert len(calls) == 1
-    assert _root_output(exp) == "final answer"
+    assert _root_outputs(exp) == ["final answer"]
+
+
+def test_stop_ignores_matching_text_from_an_earlier_turn(tmp_path, monkeypatch):
+    # The previous turn ended with the same words. That row must not count as
+    # this turn's final answer.
+    earlier = [_user("first question", "2026-06-21T00:00:00Z"),
+               _assistant("r0", "2026-06-21T00:00:01Z", "final answer")]
+    this_turn = [_user("read the file", "2026-06-22T00:00:00Z"),
+                 _assistant("r1", "2026-06-22T00:00:01Z", TOOL_USE),
+                 TOOL_RESULT]
+    final = _assistant("r2", "2026-06-22T00:00:03Z", "final answer")
+    exp, calls = _setup(tmp_path, monkeypatch,
+                        [earlier + this_turn, earlier + this_turn + [final]])
+    _stop(tmp_path, "sess-earlier", "final answer")
+    assert len(calls) == 2
+    assert _root_outputs(exp) == ["final answer", "final answer"]
+
+
+def test_stop_ignores_earlier_text_that_only_ends_the_same(tmp_path, monkeypatch):
+    # "Done." is on disk from the first call; the final answer merely ends with it.
+    partial = [_user("fix it", "2026-06-22T00:00:00Z"),
+               _assistant("r1", "2026-06-22T00:00:01Z", "Done.", TOOL_USE),
+               TOOL_RESULT]
+    final = _assistant("r2", "2026-06-22T00:00:03Z", "All good. Done.")
+    exp, calls = _setup(tmp_path, monkeypatch, [partial, partial + [final]])
+    _stop(tmp_path, "sess-suffix", "All good. Done.")
+    assert len(calls) == 2
+    assert _root_outputs(exp) == ["All good. Done."]
+
+
+def test_stop_accepts_final_message_split_across_text_rows(tmp_path, monkeypatch):
+    # Claude Code writes one row per content block and joins the blocks with a
+    # newline in last_assistant_message, so the last row is only the last block.
+    records = [_user("explain", "2026-06-22T00:00:00Z"),
+               _assistant("r1", "2026-06-22T00:00:01Z", "Part one"),
+               _assistant("r1", "2026-06-22T00:00:02Z", "Part two")]
+    exp, calls = _setup(tmp_path, monkeypatch, [records])
+    _stop(tmp_path, "sess-blocks", "Part one\nPart two")
+    assert len(calls) == 1
+
+
+def test_stop_gives_up_after_the_deadline_and_logs_it(tmp_path, monkeypatch):
+    # The final row never arrives: emit what is on disk and say so in the debug log.
+    exp, calls = _setup(tmp_path, monkeypatch, [RECORDS[:3]])
+    clock = iter([0.0, 0.0, 3.0])  # deadline set at 0, checked at 0, then past 2s
+    monkeypatch.setattr(emit.time, "monotonic", lambda: next(clock))
+    logged = []
+    monkeypatch.setattr(emit, "debug_log", logged.append)
+
+    _stop(tmp_path, "sess-timeout", "final answer")
+
+    assert len(calls) == 2
+    assert _root_outputs(exp) == ["Reading it."]
+    assert any("still missing" in line for line in logged)
+
+
+def test_stop_does_not_hold_the_session_lock_while_waiting(tmp_path, monkeypatch):
+    # A SubagentStop for the same session must not queue behind the wait.
+    held = []
+    real_lock = state.session_lock
+
+    def tracking_lock(session_id):
+        cm = real_lock(session_id)
+
+        class Tracked:
+            def __enter__(self):
+                held.append(True)
+                return cm.__enter__()
+
+            def __exit__(self, *a):
+                held.pop()
+                return cm.__exit__(*a)
+
+        return Tracked()
+
+    exp, calls = _setup(tmp_path, monkeypatch, [RECORDS[:3], RECORDS])
+    monkeypatch.setattr(state, "session_lock", tracking_lock)
+    monkeypatch.setattr(emit.time, "sleep", lambda s: held and (_ for _ in ()).throw(
+        AssertionError("slept while holding the session lock")))
+
+    _stop(tmp_path, "sess-lock", "final answer")
+    assert _root_outputs(exp) == ["final answer"]

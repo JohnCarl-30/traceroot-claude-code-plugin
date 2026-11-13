@@ -109,23 +109,42 @@ def _capped_flush(flush):
 # Transcript read
 # ---------------------------------------------------------------------------
 
+def _final_text_on_disk(records: list, want: str) -> bool:
+    """Return True if the current turn's last assistant text row ends `want`."""
+    for r in reversed(records):
+        if r.get("type") == "user" and not r.get("isMeta") and not _t._is_tool_result(r):
+            return False  # reached this turn's prompt: no assistant text on disk yet
+        if r.get("type") == "assistant":
+            text = _s._text(_t._content(r))
+            if text.strip():
+                # last_assistant_message is the final message's text blocks joined
+                # with "\n", and each block is its own row: the last row is the
+                # whole message or its last block. A bare suffix match would also
+                # accept an earlier row that merely ends the same way.
+                return text.strip() == want or want.endswith("\n" + text.rstrip())
+    return False
+
+
 def _read_settled(tpath: str, payload: dict) -> list:
     """Read the transcript, waiting briefly for the turn's final assistant rows.
 
     Claude Code can fire Stop before those rows are on disk. Emitting then drops
     the final answer for good, because the ask is marked emitted. The payload's
-    last_assistant_message says what the last assistant text row must end with;
+    last_assistant_message says what the last assistant text row must contain;
     without it (older Claude Code, SessionEnd) there is nothing to wait for.
+
+    Call this before taking the session lock: it can sleep for up to 2s.
     """
     want = str(payload.get("last_assistant_message") or "").strip()
     deadline = time.monotonic() + 2.0
     while True:
         records = _t.read_all_records(tpath)
-        texts = (_s._text(_t._content(r)).strip() for r in reversed(records) if r.get("type") == "assistant")
-        last = next((x for x in texts if x), "")
-        # shortcut: after 2s emit what is there (possibly truncated) rather than
-        # hold the ask; skip the ask instead if truncated traces show up in practice.
-        if not want or (last and want.endswith(last)) or time.monotonic() >= deadline:
+        if not want or _final_text_on_disk(records, want):
+            return records
+        if time.monotonic() >= deadline:
+            # shortcut: emit what is there (possibly truncated) rather than hold
+            # the ask; skip the ask instead if these log lines show up in practice.
+            debug_log(f"Stop: final assistant rows still missing after 2s, emitting what is on disk: {tpath}")
             return records
         time.sleep(0.1)
 
@@ -217,9 +236,10 @@ def handle_stop(payload: dict, is_session_end: bool = False) -> None:
     import os as _os
     subagents_dir = _os.path.join(_os.path.dirname(tpath), session_id, "subagents")
 
+    records = _read_settled(tpath, payload)  # may wait; must not hold the lock
+
     with _state.session_lock(session_id):
         st = _state.load_state(session_id)
-        records = _read_settled(tpath, payload)
         turns = _t.assemble_turns(records)
         asks = _t.group_turns_into_asks(turns, subagents_dir)
         git = _resolve_git(payload, st)
