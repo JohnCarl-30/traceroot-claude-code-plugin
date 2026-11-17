@@ -68,6 +68,19 @@ def _tool_calls(content) -> list:
     return out
 
 
+def _count(value) -> int:
+    """A usage count as a non-negative int. A malformed value counts as 0.
+
+    json.loads accepts NaN, Infinity and 1e400 (parsed as inf), so int() can
+    raise OverflowError as well as ValueError and TypeError. One bad field must
+    not raise: the hook would drop every ask in that Stop.
+    """
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def llm_calls(assistant_msgs: list[dict]) -> list[LlmCall]:
     """
     Collapse a flat list of assistant transcript messages into per-requestId LlmCall
@@ -115,19 +128,21 @@ def llm_calls(assistant_msgs: list[dict]) -> list[LlmCall]:
         call.tool_calls += new_tcs
 
         # Token accounting.
-        u = msg.get("usage") or {}
+        u = msg.get("usage")
+        if not isinstance(u, dict):
+            u = {}
         if rid not in seen_input:
             # First sighting: count input and cache tokens exactly once.
-            inp = int(u.get("input_tokens") or 0)
-            cr = int(u.get("cache_read_input_tokens") or 0)
-            cc = int(u.get("cache_creation_input_tokens") or 0)
+            inp = _count(u.get("input_tokens"))
+            cr = _count(u.get("cache_read_input_tokens"))
+            cc = _count(u.get("cache_creation_input_tokens"))
             call.prompt += inp + cr + cc
             call.cache_read += cr
             call.cache_creation += cc
             seen_input.add(rid)
 
         # Output: add only the delta over the running max for this requestId.
-        out = int(u.get("output_tokens") or 0)
+        out = _count(u.get("output_tokens"))
         prior = out_max.get(rid, 0)
         if out > prior:
             call.completion += out - prior
