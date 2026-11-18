@@ -54,7 +54,8 @@ def _role(m: dict) -> str | None:
     if t in ("user", "assistant"):
         return t
     # Any other typed row is bookkeeping, even when it carries a message with a
-    # role: api-request-blob rows copy the API request with role "user".
+    # role: api-request-blob rows copy API messages with role "user", "assistant"
+    # or "system".
     return (m.get("message") or {}).get("role") if t is None else None
 
 
