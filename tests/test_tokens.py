@@ -135,7 +135,7 @@ def test_malformed_usage_values_default_to_zero():
     The values are what json.loads returns for a transcript line, which accepts
     NaN, Infinity and out-of-range numbers such as 1e400 (parsed as inf).
     """
-    bad = ["unknown", {"bad": "shape"}, [1], float("nan"), float("inf"), float("-inf"), -50]
+    bad = ["unknown", {"bad": "shape"}, [1], float("nan"), float("inf"), float("-inf"), -50, True]
     for v in bad:
         calls = tokens.llm_calls([_usage_msg("r_bad", {
             "input_tokens": v,
@@ -147,6 +147,17 @@ def test_malformed_usage_values_default_to_zero():
         c = calls[0]
         assert (c.prompt, c.completion, c.cache_read, c.cache_creation) == (0, 0, 0, 0), v
         assert c.text == "ok"
+
+
+def test_malformed_first_frame_does_not_hide_a_later_valid_count():
+    """Input and cache are the same on every frame of a call, so a valid value on a
+    later frame is used when the first frame's value was malformed."""
+    calls = tokens.llm_calls([
+        _am("r1", "opus", "unknown", 100, cr="NaN", cc=None),
+        _am("r1", "opus", 10, 175, cr=50, cc=5),
+    ])
+    c = calls[0]
+    assert (c.prompt, c.completion, c.cache_read, c.cache_creation) == (65, 175, 50, 5)
 
 
 def test_usage_that_is_not_an_object_defaults_to_zero():

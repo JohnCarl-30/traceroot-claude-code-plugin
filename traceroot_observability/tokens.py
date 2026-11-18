@@ -75,6 +75,8 @@ def _count(value) -> int:
     raise OverflowError as well as ValueError and TypeError. One bad field must
     not raise: the hook would drop every ask in that Stop.
     """
+    if isinstance(value, bool):  # JSON true/false is not a count; int(True) is 1
+        return 0
     try:
         return max(0, int(value or 0))
     except (TypeError, ValueError, OverflowError):
@@ -89,14 +91,16 @@ def llm_calls(assistant_msgs: list[dict]) -> list[LlmCall]:
     Each requestId = one logical LLM API call. Multiple transcript lines may share
     a requestId because Claude Code writes one line per content block. The function
     groups them and applies:
-      - input / cache: counted on the FIRST sighting of each requestId only.
+      - input / cache: running MAX. Every frame of a call carries the same values,
+        so this counts them once, and a malformed first frame doesn't hide a
+        valid later one.
       - output: running MAX (add only deltas), so streaming partials don't inflate totals.
 
     Returns calls in order of first requestId appearance.
     """
     order: list[str] = []
     by_rid: dict[str, LlmCall] = {}
-    seen_input: set[str] = set()   # requestIds whose input/cache have been counted
+    in_max: dict[str, int] = {}    # requestId -> highest input_tokens seen so far
     out_max: dict[str, int] = {}   # requestId -> highest output_tokens seen so far
 
     for m in assistant_msgs:
@@ -131,15 +135,10 @@ def llm_calls(assistant_msgs: list[dict]) -> list[LlmCall]:
         u = msg.get("usage")
         if not isinstance(u, dict):
             u = {}
-        if rid not in seen_input:
-            # First sighting: count input and cache tokens exactly once.
-            inp = _count(u.get("input_tokens"))
-            cr = _count(u.get("cache_read_input_tokens"))
-            cc = _count(u.get("cache_creation_input_tokens"))
-            call.prompt += inp + cr + cc
-            call.cache_read += cr
-            call.cache_creation += cc
-            seen_input.add(rid)
+        in_max[rid] = max(in_max.get(rid, 0), _count(u.get("input_tokens")))
+        call.cache_read = max(call.cache_read, _count(u.get("cache_read_input_tokens")))
+        call.cache_creation = max(call.cache_creation, _count(u.get("cache_creation_input_tokens")))
+        call.prompt = in_max[rid] + call.cache_read + call.cache_creation
 
         # Output: add only the delta over the running max for this requestId.
         out = _count(u.get("output_tokens"))
