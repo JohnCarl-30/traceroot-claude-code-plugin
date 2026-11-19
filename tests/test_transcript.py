@@ -106,6 +106,39 @@ def test_tool_result_without_assistant_is_ignored():
     assert turns == []
 
 
+def test_bookkeeping_rows_with_a_role_are_ignored():
+    """Claude Code writes api-request-blob rows (copies of API messages) into the
+    transcript. They carry message.role "user", "assistant" or "system" but are
+    not transcript messages: they must not start a turn, add assistant frames or
+    overwrite tool results."""
+    blob_tool_result = {"type": "tool_result", "tool_use_id": "t1", "content": "copied output"}
+    records = [
+        {"type": "user", "timestamp": "2026-06-22T00:00:00Z",
+         "message": {"role": "user", "content": "the real prompt"}},
+        {"type": "api-request-blob",  # no timestamp, like the real rows
+         "message": {"role": "user", "content": [{"type": "text", "text": "<system-reminder>context</system-reminder>"}]}},
+        {"type": "api-request-blob",
+         "message": {"role": "system", "content": [{"type": "text", "text": "system prompt"}]}},
+        {"type": "assistant", "requestId": "r1", "timestamp": "2026-06-22T00:00:01Z",
+         "message": {"id": "r1", "role": "assistant", "content": [
+             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}},
+        {"type": "user", "timestamp": "2026-06-22T00:00:02Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "t1", "content": "real output"}]}},
+        {"type": "api-request-blob",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "copied answer"}]}},
+        {"type": "api-request-blob",
+         "message": {"role": "user", "content": [blob_tool_result]}},
+    ]
+    turns = transcript.assemble_turns(records)
+    assert len(turns) == 1
+    assert turns[0].user_msg["message"]["content"] == "the real prompt"
+    assert turns[0].user_msg["timestamp"] == "2026-06-22T00:00:00Z"
+    assert len(turns[0].assistant_msgs) == 1
+    assert turns[0].tool_results["t1"]["content"] == "real output"
+    assert turns[0].tool_results["t1"]["timestamp"] == "2026-06-22T00:00:02Z"
+
+
 # --- Bug A regression test ---
 
 def test_cross_read_turn_split_regression(tmp_path, monkeypatch):
@@ -190,3 +223,4 @@ def test_cross_read_turn_split_regression(tmp_path, monkeypatch):
 
     st2 = state.load_state("sess-cross")
     assert len(st2.emitted_ask_keys) == 3, f"emitted_ask_keys should have 3 entries, got {st2.emitted_ask_keys}"
+
