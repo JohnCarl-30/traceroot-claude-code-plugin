@@ -9,6 +9,8 @@ Design constraints:
   The replay test (test_emit_replay.py) monkeypatches _tracer/_resolve_git
   so those lazy imports never execute during tests.
 - Flush is capped at 5s on a daemon thread to avoid blocking Claude Code.
+- Stop waits up to _SETTLE_TIMEOUT_S for the turn's final assistant rows,
+  so that long is added to the time the hook keeps Claude Code waiting.
 - Fail-open: missing api_key, session_id, or transcript_path → return quietly.
 - emitted_ask_keys tracks which asks have been emitted by stable timestamp key;
   the whole transcript is re-parsed each Stop so cross-read-boundary splits
@@ -125,6 +127,10 @@ def _final_text_on_disk(records: list, want: str) -> bool:
     return False
 
 
+_SETTLE_TIMEOUT_S = 2.0
+_SETTLE_POLL_S = 0.1
+
+
 def _read_settled(tpath: str, payload: dict) -> list:
     """Read the transcript, waiting briefly for the turn's final assistant rows.
 
@@ -136,21 +142,23 @@ def _read_settled(tpath: str, payload: dict) -> list:
     Call this with the session lock held. A SessionEnd that arrives during the
     wait must queue behind it; otherwise it reads the half-written transcript,
     emits the ask truncated and marks it emitted. The cost is that a concurrent
-    SubagentStop can be delayed by up to 2s. It loses nothing: the sub-agent
-    transcript it copies stays on disk until its hook returns.
+    SubagentStop can be delayed by up to _SETTLE_TIMEOUT_S. It loses nothing:
+    the sub-agent transcript it copies stays on disk until its hook returns.
     """
     want = str(payload.get("last_assistant_message") or "").strip()
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + _SETTLE_TIMEOUT_S
     while True:
         records = _t.read_all_records(tpath)
         if not want or _final_text_on_disk(records, want):
             return records
         if time.monotonic() >= deadline:
-            # shortcut: emit what is there (possibly truncated) rather than hold
-            # the ask; skip the ask instead if these log lines show up in practice.
-            debug_log(f"Stop: final assistant rows still missing after 2s, emitting what is on disk: {tpath}")
+            # Give up: emit what is on disk, which may lack the final answer.
+            debug_log(
+                f"Stop: final assistant rows still missing after {_SETTLE_TIMEOUT_S:g}s, "
+                f"emitting what is on disk: {tpath}"
+            )
             return records
-        time.sleep(0.1)
+        time.sleep(_SETTLE_POLL_S)
 
 
 # ---------------------------------------------------------------------------

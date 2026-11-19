@@ -132,8 +132,9 @@ def test_stop_accepts_final_message_split_across_text_rows(tmp_path, monkeypatch
 def test_stop_gives_up_after_the_deadline_and_logs_it(tmp_path, monkeypatch):
     # The final row never arrives: emit what is on disk and say so in the debug log.
     exp, calls = _setup(tmp_path, monkeypatch, [RECORDS[:3]])
-    clock = iter([0.0, 0.0, 3.0])  # deadline set at 0, checked at 0, then past 2s
-    monkeypatch.setattr(emit.time, "monotonic", lambda: next(clock))
+    # Deadline set at 0 and checked at 0; every later reading is past it.
+    ticks = iter([0.0, 0.0])
+    monkeypatch.setattr(emit.time, "monotonic", lambda: next(ticks, 3.0))
     logged = []
     monkeypatch.setattr(emit, "debug_log", logged.append)
 
