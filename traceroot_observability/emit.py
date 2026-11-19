@@ -184,7 +184,7 @@ def _count_launched(ask_turns: list) -> int:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         if block.get("name") in ("Task", "Agent"):
                             res = turn.tool_results.get(str(block.get("id") or ""))
-                            if res is None or res.get("is_async"):
+                            if res is None or res.get("awaits_notification"):
                                 count += 1
     return count
 

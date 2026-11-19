@@ -16,12 +16,14 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from .tokens import _text
+
 
 @dataclass
 class Turn:
     user_msg: dict
     assistant_msgs: list = field(default_factory=list)
-    tool_results: dict = field(default_factory=dict)  # tool_use_id -> {"content":..., "timestamp":..., "is_error": bool, "is_async": bool}
+    tool_results: dict = field(default_factory=dict)  # tool_use_id -> {"content":..., "timestamp":..., "is_error": bool, "awaits_notification": bool (Task/Agent only)}
 
 
 def read_all_records(path: str) -> list[dict]:
@@ -73,18 +75,19 @@ def _is_tool_result(m: dict) -> bool:
     )
 
 
-def _is_async_launch(row: dict, block: dict) -> bool:
-    """Return True if this tool_result is a background sub-agent launch, i.e. the
-    sub-agent's outcome arrives later as a <task-notification> turn."""
+def _awaits_notification(row: dict, block: dict) -> bool:
+    """Return False only when this Task/Agent tool_result shows the sub-agent has
+    already finished; only then can no <task-notification> follow. Anything
+    unrecognised (a background launch, a foreground agent moved to the background)
+    stays pending: emitting late costs a delay, emitting early drops the
+    notification turn for good, because the ask key is already saved."""
+    if block.get("is_error"):
+        return False
     tur = row.get("toolUseResult")
     if isinstance(tur, dict):
-        return bool(tur.get("isAsync")) or tur.get("status") == "async_launched"
-    # shortcut: SDK harnesses omit toolUseResult, so match the launch text; switch
-    # to a structured field if they start writing one or Claude Code rewords it.
-    c = block.get("content")
-    if isinstance(c, list):
-        c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"), "")
-    return isinstance(c, str) and c.lstrip().startswith("Async agent launched")
+        return tur.get("status") != "completed"
+    # SDK harnesses write no toolUseResult, so the launch text is the only sign left.
+    return _text(block.get("content")).lstrip().startswith("Async agent launched")
 
 
 def assemble_turns(records: list[dict]) -> list[Turn]:
@@ -124,7 +127,7 @@ def assemble_turns(records: list[dict]) -> list[Turn]:
                         # Claude Code sets is_error=true on a tool_result when the tool
                         # failed (failed Bash, missing file, etc.). Surfaced as span status.
                         "is_error": bool(x.get("is_error")),
-                        "is_async": _is_async_launch(m, x),
+                        "awaits_notification": _awaits_notification(m, x),
                     }
             continue
 
