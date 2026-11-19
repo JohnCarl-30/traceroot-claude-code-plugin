@@ -205,12 +205,13 @@ def test_handle_stop_emits_complete_asks_only(tmp_path, monkeypatch):
                                  "name": "Task", "input": {"description": "do work"}}],
                     "usage": {"input_tokens": 5, "output_tokens": 3}}),
         _j(type="user", timestamp="2026-06-22T00:01:02Z",
-           # Real Claude Code shape (as in real-session-428ddacf); the other test
-           # in this file keeps the text-only shape SDK harnesses write.
+           # Real Claude Code shape (as in real-session-428ddacf), with text that
+           # does not match the launch fallback, so only toolUseResult keeps it
+           # pending. The other test in this file covers the text-only SDK shape.
            toolUseResult={"isAsync": True, "status": "async_launched"},
            message={"role": "user",
                     "content": [{"type": "tool_result", "tool_use_id": "tu-pending",
-                                 "content": "Async agent launched successfully."}]}),
+                                 "content": "agent running"}]}),
         # NO task-notification turn yet
     ]
     tpath.write_text("\n".join(lines) + "\n")
